@@ -14,13 +14,58 @@ import configparser
 import os
 import shutil
 import hashlib
-from analysis_result import AnalysisResult
+from analysis_result import AnalysisResultSuccess, AnalysisResultError, AnalysisResultNotAvailable
 from cbapi.response.models import Binary
 from cbapi.response.rest_api import CbResponseAPI
 import globals
+import multiprocessing
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+#Adapted from oriely
+class ReadWriteLock:
+    """ A lock object that allows many simultaneous "read locks", but
+    only one "write lock." """
+
+    def __init__(self):
+        self._read_ready = multiprocessing.Condition(multiprocessing.Lock(  ))
+        self._readers = 0
+
+    def acquire_read(self):
+        """ Acquire a read lock. Blocks only if a thread has
+        acquired the write lock. """
+        self._read_ready.acquire()
+        try:
+            self._readers += 1
+        finally:
+            self._read_ready.release()
+
+    def release_read(self):
+        """ Release a read lock. """
+        self._read_ready.acquire()
+        try:
+            self._readers -= 1
+            if not self._readers:
+                self._read_ready.notifyAll()
+        finally:
+            self._read_ready.release()
+
+    def acquire_write(self):
+        """ Acquire a write lock. Blocks until there are no
+        acquired read or write locks. """
+        self._read_ready.acquire()
+        while self._readers > 0:
+            self._read_ready.wait()
+
+    def release_write(self):
+        """ Release a write lock. """
+        self._read_ready.release()
+
+
+
+compiled_yara_rules = None
+compiled_rules_lock = ReadWriteLock()        
 
 g_config = dict()
 
@@ -69,128 +114,74 @@ class MyBootstep(bootsteps.Step):
 app.steps['worker'].add(MyBootstep)
 
 
-def generate_rule_map(yara_rule_path):
-    global yara_rule_map_hash
-
-    rule_map = {}
-    for fn in os.listdir(yara_rule_path):
-        if fn.lower().endswith(".yar") or fn.lower().endswith(".yara"):
-            fullpath = os.path.join(yara_rule_path, fn)
-            if not os.path.isfile(fullpath):
-                continue
-
-            last_dot = fn.rfind('.')
-            if last_dot != -1:
-                namespace = fn[:last_dot]
-            else:
-                namespace = fn
-            rule_map[namespace] = fullpath
-
-    return rule_map
-
-
-def generate_yara_rule_map_hash(yara_rule_path):
-    global g_yara_rule_map_hash_list
-
-    md5 = hashlib.md5()
-
-    temp_list = list()
-
-    for fn in os.listdir(yara_rule_path):
-        with open(os.path.join(yara_rule_path, fn), 'rb') as fp:
-            data = fp.read()
-            md5.update(data)
-            temp_list.append(str(md5.hexdigest()))
-
-    temp_list.sort()
-    return temp_list
-
-
 @app.task
-def update_yara_rules_remote(yara_rules):
+def update_yara_rules_remote(compiled_rules_data):
+    global compiled_yara_rules
+    globa. compiled_rules_lock
     try:
-        shutil.rmtree(globals.g_yara_rules_dir)
-        for key in yara_rules:
-            open(os.path.join(globals.g_yara_rules_dir, key), 'wb').write(yara_rules[key])
-    except:
-        logger.error(traceback.format_exc())
-
+        new_rules_object = yara.load(compiled_rules_data)
+    except Exception as e:
+        logger.debug(f"Error loading rules into worker : {str(e)}")
+    else: 
+        compiled_rules_lock.acquire_write()
+        compiled_yara_rules = new_rules_object
+        compiled_rules_lock.release_write()
 
 @app.task
 def analyze_binary(md5sum):
+    global compiled_rules_lock
+    global compiled_yara_rules
     logger.debug("{}: in analyze_binary".format(md5sum))
-    analysis_result = AnalysisResult(md5sum)
+
+    cb = None
 
     try:
-
-        analysis_result.last_scan_date = datetime.datetime.now()
-
         cb = CbResponseAPI(url=globals.g_cb_server_url,
                            token=globals.g_cb_server_token,
                            ssl_verify=False,
                            timeout=5)
+    except Exception as e:
+        error_msg = f"Exception occured connection to cbr from worker task {str(e)}"
+        logger.debug(error_msg)
+        return [AnalysisResultError(md5sum,error_msg=error_msg)]
 
-        binary_query = cb.select(Binary).where(f"md5:{md5sum}")
+    binary_query = cb.select(Binary).where(f"md5:{md5sum}").first()
 
-        if binary_query:
-            try:
-                binary_data = binary_query[0].file.read()
-            except:
-                analysis_result.binary_not_available = True
-                return analysis_result
+    if binary_query is None:
+        return [AnalysisResultError(md5sum,error_msg=f"Couldn't find binary for md5sum {md5sum}")]
 
-            yara_rule_map = generate_rule_map(globals.g_yara_rules_dir)
-            yara_rules = yara.compile(filepaths=yara_rule_map)
+    binary_data = None    
+    try:
+        binary_data = binary_query[0].file.read()
+    except IOError as e:
+        return [AnalysisResultError(md5sum,error_msg=str(e))]
 
-            try:
-                # matches = "debug"
-                matches = yara_rules.match(data=binary_data, timeout=30)
-            except yara.TimeoutError:
-                #
-                # yara timed out
-                #
-                analysis_result.last_error_msg = "Analysis timed out after 30 seconds"
-                analysis_result.stop_future_scans = True
-            except yara.Error:
+    try:
+        # matches = "debug"
+        compiled_yara_rules.acquire_read()
+        matches = yara_rules.match(data=binary_data, timeout=30)
+        compiled_rules_lock.release_read()
+        analysis_results = []
+        for match in matches:
+            r = match.rule
+            score = match.meta.get('score',100)
+            logger.debug(f{"Rule {r} matched {md5sum} with {score} !"})
+            analysis_results.append(AnalysisResultSuccess(md5sum,score))
+        return analysis_results      
+    except yara.TimeoutError as yte:
+        #
+        # yara timed out
+        #
+        logger.debug("Timed out scanning {md5sum} {yte.message}")
+        return [AnalysisResultError(md5sum,error_msg=f"{yte.message}")]
+    except yara.Error as ye:
                 #
                 # Yara errored while trying to scan binary
                 #
-                analysis_result.last_error_msg = "Yara exception"
-            except:
-                analysis_result.last_error_msg = traceback.format_exc()
-            else:
-                if matches:
-                    score = getHighScore(matches)
-                    analysis_result.score = score
-                    analysis_result.short_result = "Matched yara rules: %s" % ', '.join(
-                        [match.rule for match in matches])
-                    # analysis_result.short_result = "Matched yara rules: debug"
-                    analysis_result.long_result = analysis_result.long_result
-                    analysis_result.misc = generate_yara_rule_map_hash(globals.g_yara_rules_dir)
-                else:
-                    analysis_result.score = 0
-                    analysis_result.short_result = "No Matches"
+        logger.debug("Yara error when scanning {md5sum} {ye.message}")
+        return [AnalysisResultError(md5sum,error_msg=f"{ye.message}")]        
+    except Exception as e: 
+        logger.debug(f"Something went wrong scanning {md5sum}....{str(e)}")
+        logger.debug(traceback.format_exc())
 
-        else:
-            analysis_result.binary_not_available = True
-        return analysis_result
-    except:
-        error = traceback.format_exc()
-        logger.error(traceback.format_exc())
-        analysis_result.last_error_msg = error
-        return analysis_result
-
-
-def getHighScore(matches):
-    #######
-    # if str(matches) == "debug":
-    #     return 100
-    #######
-    score = 0
-    for match in matches:
-        if match.meta.get('score', 0) > score:
-            score = match.meta.get('score')
-    if score == 0:
-        return 100
-    else:
-        return score
+        return [AnalysisResultError(md5sum,error_msg=str(e))]

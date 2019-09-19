@@ -9,6 +9,7 @@ import json
 from datetime import datetime, timedelta
 from peewee import SqliteDatabase
 from tasks import analyze_binary, update_yara_rules_remote, generate_rule_map, app
+from analysis_result import AnalysisResultSuccess, AnalysisResultError, AnalysisResultNotAvailable, AnalysisResultType
 import globals
 import argparse
 import configparser
@@ -17,7 +18,7 @@ import yara
 
 from feed import CbFeed, CbFeedInfo, CbReport
 from celery import group
-from binary_database import db, BinaryDetonationResult
+from binary_database import db, DetonationResult, Rule, Binary
 import singleton
 
 logging_format = '%(asctime)s-%(name)s-%(lineno)d-%(levelname)s-%(message)s'
@@ -31,7 +32,7 @@ celery_logger.setLevel(logging.ERROR)
 
 
 def generate_feed_from_db():
-    query = BinaryDetonationResult.select().where(BinaryDetonationResult.score > 0)
+    query = DetonationResult.select().where(DetonationResult.score > 0)
     reports = list()
 
     for binary in query:
@@ -40,8 +41,8 @@ def generate_feed_from_db():
                   'timestamp': int(time.mktime(time.gmtime())),
                   'link': '',
                   'id': 'binary_{0}'.format(binary.md5),
-                  'title': binary.last_success_msg,
-                  'description': binary.last_success_msg
+                  'title': binary.rule,
+                  'description': binary.rule
                   }
 
         reports.append(CbReport(**fields))
@@ -78,6 +79,39 @@ def generate_yara_rule_map_hash(yara_rule_path):
 
     globals.g_yara_rule_map_hash_list = temp_list
     globals.g_yara_rule_map_hash_list.sort()
+
+def load_yara_rules_to_db(yara_rule_path):
+    filepaths = {}
+    with os.scandir(yara_rule_path) as it:
+        for entry in it:
+            if not entry.name.startswith('.') and entry.is_file():
+                filepaths.update({entry.name:entry.path})
+    
+    rules = yara.compile(filepaths=filepaths)
+
+    rules.save(os.path.join(yara_rule_path,".compiledrules"))
+
+    currentrulenames = []
+
+    for i, r in enumerate(rules):
+        logger.debug(f"Trying to write rulename {r.identifier} to rule table")
+        currentrulenames.append(r.identifier)
+        r,created = Rule.get_or_create(rulename=r.identifier)
+        if created:
+            r.save()
+
+    removed_rules = []    
+
+    for r in Rule.select():
+        logger.debug(f"Rules in database : {r.rulename}")
+        if r not in currentrulenames:
+            logger.debug(f"Trying to delete rule: {r.rulename}")
+            r.delete_instance()
+            removed_rules.append(r.rulename)
+
+    for deleted_rule in removed_rules:
+        logger.debug(f"Trying to delete results for removed rule {deleted_rule}")
+        DetonationResult.delete().where(DetonationResult.rule == deleted_rule)
 
 
 def generate_rule_map_remote(yara_rule_path):
@@ -134,19 +168,18 @@ def analyze_binaries(md5_hashes, local):
 
 def save_results(analysis_results):
     for analysis_result in analysis_results:
-        if analysis_result.binary_not_available:
+        if analysis_result._type is AnalysisResultType.NOTAVAILABLE:
             globals.g_num_binaries_not_available += 1
             continue
 
-        bdr, created = BinaryDetonationResult.get_or_create(md5=analysis_result.md5)
+        if analysis_result._type is AnalysisResultType.ERROR:
+            #TODO - SHOULD WE BOTHER WRITING ERRORS TO THE DATABASE?
+            #TODO ' STOP FUTURE SCANS ' 
+            continue
+
+        bdr, created = DetonationResult.get_or_create(md5=analysis_result.md5,rule=analysis_result.rule,score=analysis_result.score)
 
         try:
-            bdr.md5 = analysis_result.md5
-            bdr.last_scan_date = datetime.now()
-            bdr.score = analysis_result.score
-            bdr.last_error_msg = analysis_result.last_error_msg
-            bdr.last_success_msg = analysis_result.short_result
-            bdr.misc = json.dumps(globals.g_yara_rule_map_hash_list)
             bdr.save()
             globals.g_num_binaries_analyzed += 1
         except:
@@ -205,10 +238,10 @@ def perform(yara_rule_dir):
             #
             # Check if query returns any rows
             #
-            query = BinaryDetonationResult.select().where(BinaryDetonationResult.md5 == md5_hash)
+            query = DetonationResult.select().where(DetonationResult.md5 == md5_hash)
             if query.exists():
                 try:
-                    bdr = BinaryDetonationResult.get(BinaryDetonationResult.md5 == md5_hash)
+                    bdr = DetonationResult.get(DetonationResult.md5 == md5_hash)
                     scanned_hash_list = json.loads(bdr.misc)
                     if globals.g_disable_rescan and bdr.misc:
                         continue
@@ -230,8 +263,8 @@ def perform(yara_rule_dir):
                 analysis_results = analyze_binaries(md5_hashes, local=(not globals.g_remote))
                 if analysis_results:
                     for analysis_result in analysis_results:
-                        if analysis_result.last_error_msg:
-                            logger.error(analysis_result.last_error_msg)
+                        if analysis_result._type is AnalysisResultType.ERROR:
+                            logger.error(analysis_result.error_msg)
                     save_results(analysis_results)
                 else:
                     pass
@@ -245,8 +278,7 @@ def perform(yara_rule_dir):
             logger.debug("number binaries unavailable: {0}".format(globals.g_num_binaries_not_available))
             logger.info("total binaries from db: {0}".format(num_total_binaries))
             logger.debug("binaries per second: {0}:".format(round(num_total_binaries / elapsed_time, 2)))
-            logger.info("num binaries score greater than zero: {0}".format(
-                len(BinaryDetonationResult.select().where(BinaryDetonationResult.score > 0))))
+            logger.info("num binaries score greater than zero: {0}".format(len(DetonationResult.select().where(DetonationResult.score > 0))))
             logger.info("")
 
     conn.close()
@@ -254,8 +286,8 @@ def perform(yara_rule_dir):
     analysis_results = analyze_binaries(md5_hashes, local=(not globals.g_remote))
     if analysis_results:
         for analysis_result in analysis_results:
-            if analysis_result.last_error_msg:
-                logger.error(analysis_result.last_error_msg)
+            if analysis_result._type == AnalysisResultType.ERROR:
+                logger.error(analysis_result.error_msg)
         save_results(analysis_results)
     md5_hashes = list()
 
@@ -267,8 +299,7 @@ def perform(yara_rule_dir):
     logger.info("total binaries from db: {0}".format(num_total_binaries))
     logger.info(f"number of binaries queued to be scanned: {num_binaries_queued}")
     logger.debug("binaries per second: {0}:".format(round(num_total_binaries / elapsed_time, 2)))
-    logger.info("num binaries score greater than zero: {0}".format(
-        len(BinaryDetonationResult.select().where(BinaryDetonationResult.score > 0))))
+    logger.info("num binaries score greater than zero: {0}".format(len(DetonationResult.select().where(DetonationResult.score > 0))))
     logger.info("")
 
     generate_feed_from_db()
@@ -398,7 +429,8 @@ def main():
                     database = SqliteDatabase(database_path)
                     db.initialize(database)
                     db.connect()
-                    db.create_tables([BinaryDetonationResult])
+                    db.create_tables([Rule, Binary, DetonationResult])
+                    load_yara_rules_to_db(globals.g_yara_rules_dir)
                     generate_feed_from_db()
                     perform(globals.g_yara_rules_dir)
                 except:

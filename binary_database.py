@@ -1,7 +1,7 @@
 import logging
 
-from peewee import *
-from playhouse.sqliteq import SqliteQueueDatabase
+from peewee import Proxy, Model
+from peewee import CharField, IntegerField, ForeignKeyField, BooleanField
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -12,43 +12,28 @@ logger.setLevel(logging.DEBUG)
 db = Proxy()
 
 
-class BinaryDetonationResult(Model):
-    md5 = CharField(index=True, unique=True)
-    last_scan_date = DateTimeField(null=True)
-    last_success_msg = CharField(default='', null=True)
-
-    last_error_msg = CharField(default='', null=True)
-    last_error_date = DateTimeField(null=True)
-
-    score = IntegerField(default=0)
-
-    scan_count = IntegerField(default=0)
-
-    #
-    # If There was a permanent error then set this to True
-    #
+class Binary(Model):
+    md5 = CharField(index=True, null=False,primary_key=True)
     stop_future_scans = BooleanField(default=False)
+    binary_available = BooleanField(null=True, default=True)
 
-    #
-    # if we could not download the binary then set this to False
-    # We will need to wait for alliance download
-    #
-    binary_not_available = BooleanField(null=True)
+    class Meta:
+        database = db
 
-    #
-    # Last attempt to scan this binary.  Which could have thrown an error if the binary was not available to download
-    #
-    last_scan_attempt = DateTimeField(null=True)
 
-    #
-    #
-    #
-    num_attempts = IntegerField(default=0)
+class Rule(Model):
+    rulename = CharField(index=True, null=False,primary_key=True)
 
-    #
-    # Misc use for connectors
-    #
-    misc = CharField(default='')
+    class Meta:
+        database = db
+
+
+class DetonationResult(Model):
+    md5 = ForeignKeyField(Binary, backref="results")
+    rule = ForeignKeyField(Rule, backref="results")
+    error = BooleanField(null=True, default=False)
+    error_msg = CharField(null=True, default="")
+    score = IntegerField(default=0)
 
     class Meta:
         database = db
